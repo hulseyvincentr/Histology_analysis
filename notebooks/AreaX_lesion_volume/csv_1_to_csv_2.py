@@ -25,8 +25,8 @@ expected_regions = ["Area_X.roi", "Striatum.roi", "Lesion.roi", "LMAN.roi"]
 
 unique_image_names = []
 all_images_names = []
-for i in range(len(df["slide_name"])):
-    slide_name = df["slide_name"].iloc[i]
+for i in range(len(df["Image Name"])):
+    slide_name = df["Image Name"].iloc[i]
     image_name = slide_name.split(".jpg")[0]
     
     all_images_names.append(image_name)
