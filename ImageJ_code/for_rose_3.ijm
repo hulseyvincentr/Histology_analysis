@@ -1,8 +1,8 @@
 
 //Enter the path to images here
-directory = "/Volumes/LaCie/Microscope_images_from_glab/Area_X_Nissl_Images/USA5336_020824.01.02_NISSL_5x/020824.02_right_hemisphere/";
+directory = "/Volumes/my_own_ssd/microscope_images/USA5510/lower_hemisphere";
 //Enter the path to a folder to save ROI files
-ROI_folder_path  = "/Volumes/LaCie/Microscope_images_from_glab/Area_X_Nissl_Images/USA5336_020824.01.02_NISSL_5x/020824.02_right_hemisphere/ROIs/"
+ROI_folder_path  = "/Volumes/my_own_ssd/microscope_images/USA5510/lower_hemisphere/ROIs"
 
 //Create table, set settings for dialog box, make list of files in image folder
 Table.create("Lesion Area");
