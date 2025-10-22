@@ -2,27 +2,26 @@
 # quantify_section_areas_and_volumes.py
 from __future__ import annotations
 
-from pathlib import Path
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple, Union
+from pathlib import Path
+from typing import Dict, List, Optional, Union
 
+import os
 import re
-import math
+import json
 import pandas as pd
 import matplotlib.pyplot as plt
 
-# Shapely (install if missing): pip install shapely
+# Requires shapely: pip install shapely
 try:
     from shapely.geometry import Polygon, LineString
     from shapely.ops import split as shapely_split
 except Exception as e:
-    raise ImportError(
-        "This module requires 'shapely'. Install with: pip install shapely"
-    ) from e
+    raise ImportError("This module requires 'shapely'. Install with: pip install shapely") from e
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Parsing
+# Helpers: parsing & geometry
 # ──────────────────────────────────────────────────────────────────────────────
 _NONE_TOKENS = {
     "none", "none present", "none_present", "no shape", "not present",
@@ -30,7 +29,7 @@ _NONE_TOKENS = {
 }
 
 def _parse_coords_cell(cell: Union[str, float, int, None]) -> Optional[List[float]]:
-    """Robustly parse a coord cell into a list[float] or None."""
+    """Parse '(1,2,3)', '1, 2, 3,', or numbers; return list[float] or None for 'none' tokens."""
     if cell is None:
         return None
     if isinstance(cell, (int, float)):
@@ -71,47 +70,109 @@ def _coords_to_line(x: Optional[List[float]], y: Optional[List[float]]) -> Optio
     return LineString(zip(x[:n], y[:n]))
 
 
-def _get_section_number(image_name: str, *, pattern: str = r"sect(\d+)") -> Optional[int]:
+def _get_section_number(image_name: str, pattern: str) -> Optional[int]:
     m = re.search(pattern, str(image_name))
     return int(m.group(1)) if m else None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Core API
+# Public config, outputs, and API
 # ──────────────────────────────────────────────────────────────────────────────
 @dataclass
 class SeriesQuantConfig:
     csv_path: Union[str, Path]
-    microns_per_pixel: float            # e.g., if 500 px = 568 μm, set 568/500
-    section_thickness_um: float = 75.0  # thickness of one section in μm
-    section_regex: str = r"sect(\d+)"   # how to read section number from Image Name
-    choose_inside: str = "prompt"       # 'prompt' | 'overlap_area_x' | 'skip'
-    plot_split_when_prompt: bool = True # show the split plot when prompting
-    out_csv_path: Optional[Union[str, Path]] = None  # write a CSV if given
+    microns_per_pixel: float            # e.g., if 500 px == 568 μm, set 568/500
+    section_thickness_um: float = 75.0  # thickness per section in μm
+    section_regex: str = r"sect(\d+)"   # how to extract the section number
+    plot_split_when_prompt: bool = True # show plot before asking 1/2
+    output_dir: Optional[Union[str, Path]] = None  # ask user if None
+    write_summary_json: bool = True     # also write totals JSON
 
 
-def quantify_section_areas_and_volumes(cfg: SeriesQuantConfig) -> pd.DataFrame:
+@dataclass
+class QuantifyOutput:
+    dataframe: pd.DataFrame
+    per_row_csv: Path
+    tallies: Dict[str, float]
+    summary_json: Optional[Path]
+
+
+def _choose_output_dir(cfg: SeriesQuantConfig) -> Path:
+    """Resolve the output directory by config or user prompt, then create it."""
+    if cfg.output_dir is None:
+        default_dir = Path(cfg.csv_path).parent
+        user = input(f"Enter output directory (press Enter for default: {default_dir}): ").strip()
+        out_dir = Path(os.path.expanduser(user)) if user else default_dir
+    else:
+        out_dir = Path(os.path.expanduser(str(cfg.output_dir)))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return out_dir.resolve()
+
+
+def _tally_totals(df: pd.DataFrame, results_csv_path: Path) -> Dict[str, float]:
+    """Compute final totals/percentages, matching your keys."""
+    def colsum(col: str) -> float:
+        return float(df[col].sum()) if col in df.columns else 0.0
+
+    total_area_x_volume = colsum("Area X Volume (um^3)")
+    total_overlap_volume_x = colsum("Overlap Volume with Area X (um^3)")
+    total_lman_volume = colsum("LMAN Volume (um^3)")
+    total_overlap_volume_lman = colsum("Overlap Volume with LMAN (um^3)")
+    total_lesion_outside_striatum = colsum("Lesion Volume outside Striatum (um^3)")
+
+    percent_area_x_lesioned = (100.0 * total_overlap_volume_x / total_area_x_volume) if total_area_x_volume else 0.0
+    percent_lman_lesioned = (100.0 * total_overlap_volume_lman / total_lman_volume) if total_lman_volume else 0.0
+
+    tallied_results = {
+        "Total Volume of Area X (um^3)": total_area_x_volume,
+        "Volume of Lesion Overlap with Area X (um^3)": total_overlap_volume_x,
+        "Percent of Area X Lesioned (%)": percent_area_x_lesioned,
+        "Total Volume of LMAN (um^3)": total_lman_volume,
+        "Volume of Lesion Overlap with LMAN (um^3)": total_overlap_volume_lman,
+        "Percent of LMAN Lesioned (%)": percent_lman_lesioned,
+        "Total Volume of Lesion Outside Striatum (Anterior) (um^3)": total_lesion_outside_striatum,
+    }
+
+    print(f"Reading file: {results_csv_path}")
+    for k, v in tallied_results.items():
+        print(f"{k}: {v}")
+    return tallied_results
+
+
+def quantify_section_areas_and_volumes(cfg: SeriesQuantConfig) -> QuantifyOutput:
     """
-    Quantify areas (px², μm²) and volumes (μm³) across all rows in a CSV,
-    compute overlaps (Lesion∩Area X, Lesion∩LMAN), and optionally split the
-    Lesion by the Striatum line to report inside/outside lesion area/volume.
+    Quantify areas (px², μm²) and volumes (μm³) for Lesion, Area X, LMAN across all rows.
+    If the lesion intersects the striatum line, split the lesion polygon with that line,
+    show a labeled plot with 'Lesion Part 1' and 'Lesion Part 2', and prompt the user
+    to enter **1 or 2** for which part lies within the striatum.
 
-    Returns a DataFrame and optionally writes CSV to cfg.out_csv_path.
+    Always writes:
+      - per-row CSV:  '<stem>_areas_and_volumes.csv'
+      - summary JSON: '<stem>_final_volumes.json' (if cfg.write_summary_json)
+
+    Files are saved in the chosen output_dir (asked interactively if not provided).
     """
     csv_path = Path(cfg.csv_path)
     df = pd.read_csv(csv_path).copy()
 
-    # Sort by section number (handles gaps by multiplying thickness by the gap)
-    df["Section Number"] = df.get("Image Name", "").apply(
-        lambda s: _get_section_number(s, pattern=cfg.section_regex)
-    )
-    df = df.sort_values(["Section Number"]).reset_index(drop=True)
+    # Build Section Number from 'Image Name' if present; otherwise keep None
+    if "Image Name" in df.columns:
+        names = df["Image Name"].astype(str)
+    else:
+        names = pd.Series([None] * len(df), index=df.index)
+
+    df["Section Number"] = names.apply(lambda s: _get_section_number(s or "", cfg.section_regex))
+
+    # Only sort if any section numbers are present
+    if df["Section Number"].notna().any():
+        df = df.sort_values(["Section Number"]).reset_index(drop=True)
+    else:
+        df = df.reset_index(drop=True)
 
     rows: List[Dict[str, Union[str, int, float, None]]] = []
 
-    # Precompute scaling factors
-    μm_per_px = float(cfg.microns_per_pixel)
-    area_scale = μm_per_px ** 2  # px² -> μm²
+    um_per_px = float(cfg.microns_per_pixel)
+    area_scale = um_per_px ** 2  # px² -> μm²
 
     for idx, row in df.iterrows():
         # Parse coords
@@ -124,27 +185,26 @@ def quantify_section_areas_and_volumes(cfg: SeriesQuantConfig) -> pd.DataFrame:
         lmn_x = _parse_coords_cell(row.get("LMAN_x_coords"))
         lmn_y = _parse_coords_cell(row.get("LMAN_y_coords"))
 
-        # Build geometries
         lesion_poly = _coords_to_polygon(les_x, les_y)
         area_x_poly = _coords_to_polygon(axx_x, axx_y)
         lman_poly   = _coords_to_polygon(lmn_x, lmn_y)
         str_line    = _coords_to_line(str_x, str_y)
 
-        # Areas (px²)
+        # Areas in px²
         lesion_area_px2   = lesion_poly.area if lesion_poly else 0.0
         area_x_area_px2   = area_x_poly.area if area_x_poly else 0.0
         lman_area_px2     = lman_poly.area if lman_poly else 0.0
         overlap_x_px2     = lesion_poly.intersection(area_x_poly).area if (lesion_poly and area_x_poly and lesion_poly.intersects(area_x_poly)) else 0.0
         overlap_lman_px2  = lesion_poly.intersection(lman_poly).area if (lesion_poly and lman_poly and lesion_poly.intersects(lman_poly)) else 0.0
 
-        # Areas (μm²)
+        # Convert to μm²
         lesion_area_um2  = lesion_area_px2 * area_scale
         area_x_area_um2  = area_x_area_px2 * area_scale
         lman_area_um2    = lman_area_px2 * area_scale
         overlap_x_um2    = overlap_x_px2 * area_scale
         overlap_lman_um2 = overlap_lman_px2 * area_scale
 
-        # Effective thickness by section gap
+        # Effective thickness by section gaps (if any)
         sect_num = row.get("Section Number")
         if idx == 0 or pd.isna(sect_num):
             eff_thick_um = cfg.section_thickness_um
@@ -153,74 +213,58 @@ def quantify_section_areas_and_volumes(cfg: SeriesQuantConfig) -> pd.DataFrame:
             if pd.isna(prev_sect):
                 eff_thick_um = cfg.section_thickness_um
             else:
-                gap = max(1, int(sect_num) - int(prev_sect))  # at least 1
+                gap = max(1, int(sect_num) - int(prev_sect))
                 eff_thick_um = gap * cfg.section_thickness_um
 
-        # Volumes (μm³) = area (μm²) × thickness (μm)
+        # Volumes (μm³)
         lesion_vol_um3  = lesion_area_um2  * eff_thick_um
         area_x_vol_um3  = area_x_area_um2  * eff_thick_um
         lman_vol_um3    = lman_area_um2    * eff_thick_um
         overlap_x_um3   = overlap_x_um2    * eff_thick_um
         overlap_lman_um3= overlap_lman_um2 * eff_thick_um
 
-        # Split lesion by striatum
+        # Split lesion by striatum line (interactive 1/2 choice)
         inside_um2 = outside_um2 = inside_um3 = outside_um3 = 0.0
         if lesion_poly and str_line and lesion_poly.intersects(str_line):
             parts = shapely_split(lesion_poly, str_line)
             if not parts.is_empty and len(parts.geoms) >= 2:
-                p1, p2 = parts.geoms[:2]
+                # Take two largest pieces (robust vs tiny slivers)
+                parts_sorted = sorted(parts.geoms, key=lambda p: p.area, reverse=True)
+                p1, p2 = parts_sorted[0], parts_sorted[1]
+
                 a1_um2 = p1.area * area_scale
                 a2_um2 = p2.area * area_scale
                 v1_um3 = a1_um2 * eff_thick_um
                 v2_um3 = a2_um2 * eff_thick_um
 
-                choice = None
-                if cfg.choose_inside == "overlap_area_x" and area_x_poly:
-                    # Choose the part with larger overlap with Area X
-                    o1 = p1.intersection(area_x_poly).area
-                    o2 = p2.intersection(area_x_poly).area
-                    choice = 1 if o1 >= o2 else 2
-                elif cfg.choose_inside == "prompt":
-                    # Quick plot to let the user pick
-                    if cfg.plot_split_when_prompt:
-                        plt.figure(figsize=(7, 7))
-                        # Striatum line
-                        if str_line:
-                            xs, ys = str_line.xy
-                            plt.plot(xs, ys, color="tab:blue", lw=1.6, label="Striatum")
-                        # Original lesion
-                        lx, ly = lesion_poly.exterior.xy
-                        plt.fill(lx, ly, color="tab:red", alpha=0.25, label="Lesion")
-                        # Parts
-                        for i, part in enumerate([p1, p2], start=1):
-                            px, py = part.exterior.xy
-                            plt.fill(px, py, alpha=0.5, label=f"Part {i}")
-                        plt.gca().invert_yaxis()
-                        plt.gca().set_aspect("equal", adjustable="box")
-                        plt.legend()
-                        plt.title(f"Split lesion — {row.get('Image Name', f'row{idx}')}")
-                        plt.xlabel("X (px)"); plt.ylabel("Y (px)")
-                        plt.tight_layout(); plt.show()
+                # Plot to help choose
+                if cfg.plot_split_when_prompt:
+                    plt.figure(figsize=(7, 7))
+                    xs, ys = str_line.xy
+                    plt.plot(xs, ys, color="tab:blue", lw=1.8, label="Striatum (Line)")
+                    lx, ly = lesion_poly.exterior.xy
+                    plt.fill(lx, ly, color="tab:red", alpha=0.25, label="Lesion Area")
+                    for i, part in enumerate([p1, p2], start=1):
+                        px, py = part.exterior.xy
+                        plt.fill(px, py, alpha=0.5, label=f"Lesion Part {i}")
+                        cx, cy = part.centroid.coords[0]
+                        plt.text(cx, cy, str(i), ha="center", va="center", fontsize=12)
+                    plt.xlabel("X Coordinates"); plt.ylabel("Y Coordinates")
+                    plt.title(f"Lesion Area Split by Striatum for {row.get('Image Name', f'row{idx}')}")
+                    plt.legend(); plt.gca().invert_yaxis()
+                    plt.gca().set_aspect("equal", adjustable="box")
+                    plt.tight_layout(); plt.show()
 
-                    # Prompt
-                    _ans = input(f"[{row.get('Image Name','row'+str(idx))}] Which part is inside Striatum? Enter 1 or 2: ").strip()
-                    choice = 1 if _ans == "1" else 2 if _ans == "2" else None
-
-                # assign inside/outside (default: larger area as 'inside' if no choice)
-                if choice == 1:
+                # Console prompt: strictly 1 or 2
+                ans = input(f"[{row.get('Image Name','row'+str(idx))}] Enter the part number (1 or 2) that is within the striatum: ").strip()
+                if ans == "1":
                     inside_um2, outside_um2 = a1_um2, a2_um2
                     inside_um3, outside_um3 = v1_um3, v2_um3
-                elif choice == 2:
+                elif ans == "2":
                     inside_um2, outside_um2 = a2_um2, a1_um2
                     inside_um3, outside_um3 = v2_um3, v1_um3
                 else:
-                    # fallback: label the larger part as "inside"
-                    if a1_um2 >= a2_um2:
-                        inside_um2, outside_um2 = a1_um2, a2_um2
-                        inside_um3, outside_um3 = v1_um3, v2_um3
-                    else:
-                        inside_um2, outside_um2 = a2_um2, a1_um2
-                        inside_um3, outside_um3 = v2_um3, v1_um3
+                    print("Invalid input (expected '1' or '2'). Inside/outside set to 0 for this row.")
 
         rows.append({
             "Image Name": row.get("Image Name"),
@@ -253,40 +297,51 @@ def quantify_section_areas_and_volumes(cfg: SeriesQuantConfig) -> pd.DataFrame:
 
     out_df = pd.DataFrame(rows)
 
-    # Optional write
-    if cfg.out_csv_path:
-        out_path = Path(cfg.out_csv_path)
-        if out_path.is_dir():
-            base = Path(cfg.csv_path).with_suffix("").name
-            out_path = out_path / f"{base}_areas_and_volumes.csv"
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_df.to_csv(out_path, index=False)
-        print("Saved:", out_path)
+    # Resolve and create output_dir (prompt if needed)
+    out_dir = _choose_output_dir(cfg)
+    base = Path(cfg.csv_path).with_suffix("").name
 
-    return out_df
+    # Always write per-row CSV in output_dir
+    per_row_csv = out_dir / f"{base}_areas_and_volumes.csv"
+    out_df.to_csv(per_row_csv, index=False)
+    print("Saved:", per_row_csv)
+
+    # Compute tallies and print
+    tallies = _tally_totals(out_df, per_row_csv)
+
+    # Optionally write the summary JSON in output_dir
+    summary_json: Optional[Path] = None
+    if cfg.write_summary_json:
+        summary_json = out_dir / f"{base}_final_volumes.json"
+        with open(summary_json, "w") as f:
+            json.dump(tallies, f, indent=4)
+        print(f"Analysis complete. Results saved to '{summary_json}'")
+
+    return QuantifyOutput(
+        dataframe=out_df,
+        per_row_csv=per_row_csv,
+        tallies=tallies,
+        summary_json=summary_json,
+    )
 
 
 """
-from pathlib import Path
 from quantify_section_areas_and_volumes import SeriesQuantConfig, quantify_section_areas_and_volumes
 
 csv_path = "/Users/mirandahulsey-vincent/Documents/allPythonCode/Histology_analysis/inputs/USA5510_Lower_Hemisphere_Lesion_Area_converted_for_validation.csv"
 
-# If 500 px == 568 μm, then microns_per_pixel = 568/500
-μm_per_px = 568 / 500
+um_per_px = 568.0 / 500.0  # if 500 px == 568 μm
 
 cfg = SeriesQuantConfig(
     csv_path=csv_path,
-    microns_per_pixel=μm_per_px,
+    microns_per_pixel=um_per_px,
     section_thickness_um=75.0,
-    section_regex=r"sect(\d+)",          # adjust if your names differ
-    choose_inside="prompt",               # 'prompt' | 'overlap_area_x' | 'skip'
+    section_regex=r"sect(\d+)",
     plot_split_when_prompt=True,
-    out_csv_path=Path(csv_path).with_suffix("").parent,  # save alongside input
+    output_dir= "/Users/mirandahulsey-vincent/Documents/allPythonCode/Histology_analysis/inputs"
 )
 
-results_df = quantify_section_areas_and_volumes(cfg)
-print(results_df.head(10))
+res = quantify_section_areas_and_volumes(cfg)
 
 
 """

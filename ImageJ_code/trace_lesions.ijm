@@ -1,8 +1,8 @@
 // ─────────────────────────────────────────────────────────────
 // Paths (edit these):
 // ─────────────────────────────────────────────────────────────
-directory       = "/Volumes/my_own_ssd/microscope_images/USA5510/lower_hemisphere";
-ROI_folder_path = "/Volumes/my_own_ssd/microscope_images/USA5510/lower_hemisphere_ROIs/";
+directory       = "/Volumes/my_own_ssd/microscope_images/USA5510/upper_hemisphere";
+ROI_folder_path = "/Volumes/my_own_ssd/microscope_images/USA5510/upper_hemisphere_ROIs/";
 table_save_path = ROI_folder_path + "Lesion_Area.csv";
 
 // Regions and default tools (used only when we need to annotate)
@@ -18,6 +18,9 @@ DEBUG = 1;
 sep = File.separator;
 if (!endsWith(directory, sep))       directory       = directory + sep;
 if (!endsWith(ROI_folder_path, sep)) ROI_folder_path = ROI_folder_path + sep;
+
+// Make sure ROI folder exists
+File.makeDirectory(ROI_folder_path);
 
 // ─────────────────────────────────────────────────────────────
 // Prep
@@ -90,8 +93,10 @@ function annotate_or_absent(region_name, tool_for_annotation, present, rowIndex,
         roiManager("add");
         savepath = ROI_folder_path + roi_filename_for(base_image, region_name);
         roiManager("Save", savepath);
-        // keep in-memory list in sync so later checks reflect newly saved ROI
-        roi_filelist = Array.concat(roi_filelist, roi_filename_for(base_image, region_name));
+
+        // ── FIX: refresh the ROI file list from disk (avoids Array.concat on a string)
+        roi_filelist = getFileList(ROI_folder_path);
+
         record_selection_coords(region_name, rowIndex);
     } else {
         Table.set(region_name + "_x_coords", rowIndex, "none present");
