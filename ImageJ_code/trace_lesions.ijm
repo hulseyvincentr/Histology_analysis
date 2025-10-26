@@ -1,8 +1,8 @@
 // ─────────────────────────────────────────────────────────────
 // Paths (edit these):
 // ─────────────────────────────────────────────────────────────
-directory       = "/Volumes/my_own_ssd/microscope_images/USA5510/upper_hemisphere";
-ROI_folder_path = "/Volumes/my_own_ssd/microscope_images/USA5510/upper_hemisphere_ROIs/";
+directory       = "/Volumes/my_own_ssd/microscope_images/USA5483/upper_hemisphere";
+ROI_folder_path = "/Volumes/my_own_ssd/microscope_images/USA5483/upper_hemisphere_ROIs/";
 table_save_path = ROI_folder_path + "Lesion_Area.csv";
 
 // Regions and default tools (used only when we need to annotate)
